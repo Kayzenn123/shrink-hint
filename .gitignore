@@ -1,0 +1,5 @@
+# generated test fixtures (recreated by test.sh)
+test/.fixtures/
+# editor / OS noise
+*.swp
+.DS_Store

@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# shrink-hint — interactive TUI advisor: scan media files, show key metadata,
+# and suggest concrete ffmpeg compression commands with size estimates.
+# Read-only: it never modifies your files. Requires ffprobe (part of ffmpeg).
+VERSION="1.0.0"
+set -uo pipefail
+
+# ---------------------------------------------------------------- helpers
+die()  { printf 'shrink-hint: error: %s\n' "$1" >&2; exit "${2:-1}"; }
+warn() { printf 'shrink-hint: warning: %s\n' "$1" >&2; }
+
+use_color() { [ -z "${NO_COLOR:-}" ] && [ -t 1 ]; }
+C_RED=""; C_GRN=""; C_YEL=""; C_BLD=""; C_DIM=""; C_RST=""
+if use_color; then
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YEL=$'\e[33m'
+  C_BLD=$'\e[1m';  C_DIM=$'\e[2m';  C_RST=$'\e[0m'
+fi
+
+fmt_size() { # bytes -> human
+  local b=${1:-0}
+  if (( b >= 1073741824 )); then awk -v b="$b" 'BEGIN{printf "%.1fG", b/1073741824}'
+  elif (( b >= 1048576 )); then awk -v b="$b" 'BEGIN{printf "%.1fM", b/1048576}'
+  elif (( b >= 1024 )); then awk -v b="$b" 'BEGIN{printf "%.0fK", b/1024}'
+  else printf '%dB' "$b"; fi
+}
+fmt_dur() { # seconds -> h:mm:ss / m:ss
+  local s=${1%.*} h m
+  h=$((s/3600)); m=$(((s%3600)/60)); s=$((s%60))
+  if (( h > 0 )); then printf '%d:%02d:%02d' "$h" "$m" "$s"
+  else printf '%d:%02d' "$m" "$s"; fi
+}
+lower()  { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+ext_of() { local b="${1##*/}"; b="$(lower "$b")"
+           if [[ "$b" == *.* ]]; then printf '%s' "${b##*.}"; fi; }
+
+fps_to_float() { # "30000/1001" -> "29.97"
+  case "$1" in
+    */*) awk -v v="$1" 'BEGIN{split(v,a,"/"); if(a[2]+0>0) printf "%.2f", a[1]/a[2]; else print "0"}' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# ------------------------------------------------------- ffprobe parsing
+# probe_file sets globals: P_VCODEC P_ACODEC P_W P_H P_FPS P_CH P_SR P_ABR
+# P_SIZE P_DUR P_FBR P_FMT. Empty P_VCODEC and P_ACODEC => not media/unreadable.
+probe_file() {
+  local file="$1" k v idx fld i vidx="" aidx=""
+  P_VCODEC=""; P_ACODEC=""; P_W=""; P_H=""; P_FPS=""; P_CH=""; P_SR=""
+  P_ABR=""; P_SIZE=""; P_DUR=""; P_FBR=""; P_FMT=""
+  # Pass 1: collect every stream field keyed by stream index (ffprobe flat
+  # does not guarantee codec_type comes before codec_name).
+  declare -A _ct=() _cn=() _w=() _h=() _fps=() _ch=() _sr=() _abr=()
+  while IFS='=' read -r k v; do
+    v="${v%\"}"; v="${v#\"}"
+    case "$k" in
+      streams.stream.*.*)
+        idx="${k#streams.stream.}"; fld="${idx#*.}"; idx="${idx%%.*}"
+        case "$fld" in
+          codec_type) _ct[$idx]="$v" ;; codec_name) _cn[$idx]="$v" ;;
+          width) _w[$idx]="$v" ;; height) _h[$idx]="$v" ;;
+          r_frame_rate) _fps[$idx]="$(fps_to_float "$v")" ;;
+          channels) _ch[$idx]="$v" ;; sample_rate) _sr[$idx]="$v" ;;
+          bit_rate) _abr[$idx]="$v" ;;
+        esac ;;
+      format.size) P_SIZE="$v" ;;
+      format.duration) P_DUR="$v" ;;
+      format.bit_rate) P_FBR="$v" ;;
+      format.format_name) P_FMT="${v%%,*}" ;;
+    esac
+  done < <(ffprobe -v error \
+    -show_entries format=size,duration,bit_rate,format_name \
+    -show_entries stream=index,codec_name,codec_type,width,height,r_frame_rate,channels,sample_rate,bit_rate \
+    -of flat "$file" 2>/dev/null)
+  # Pass 2: pick the lowest-index video and audio streams.
+  for i in $(printf '%s\n' "${!_ct[@]}" | sort -n); do
+    if [ "${_ct[$i]}" = "video" ] && [ -z "$vidx" ]; then vidx="$i"; fi
+    if [ "${_ct[$i]}" = "audio" ] && [ -z "$aidx" ]; then aidx="$i"; fi
+  done
+  if [ -n "$vidx" ]; then
+    P_VCODEC="${_cn[$vidx]:-}"; P_W="${_w[$vidx]:-}"
+    P_H="${_h[$vidx]:-}"; P_FPS="${_fps[$vidx]:-}"
+  fi
+  if [ -n "$aidx" ]; then
+    P_ACODEC="${_cn[$aidx]:-}"; P_CH="${_ch[$aidx]:-}"
+    P_SR="${_sr[$aidx]:-}"; P_ABR="${_abr[$aidx]:-}"
+  fi
+  [ -z "$P_SIZE" ] && P_SIZE="$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo 0)"
+}
+
+# ------------------------------------------------------- suggestion engine
+# Each suggest_* prints 4 lines: VERDICT / short title / ffmpeg command (or -) / estimate text (or -).
+# Estimates use typical-ratio factors and are always labelled "~" + "typical".
+suggest_video() { # vcodec w h fps_kbps? -> use: vcodec w h bitrate size
+  local vc="$1" w="${2:-0}" h="${3:-0}" br="${4:-0}" size="${5:-0}"
+  case "$vc" in
+    mpeg2video|mpeg4|msmpeg4v3|wmv3|vp8|theora|dvvideo|h263|h264|avc)
+      : ;;
+    hevc|h265|av1|vp9|vvc)
+      printf 'OK\nAlready efficient codec (%s)\n-\n-\n' "$vc"; return ;;
+    *) printf 'OK\nUnrecognized video codec (%s)\n-\n-\n' "${vc:-none}"; return ;;
+  esac
+  local px=$(( w * h )); [ "$px" -le 0 ] && px=$((1920*1080))
+  # Generous bitrate ceiling per resolution tier (bps). Above it, a
+  # hevc re-encode at crf 28 typically halves the file with similar quality.
+  local thresh
+  if (( px <= 500000 )); then thresh=2500000        # <=480p
+  elif (( px <= 1000000 )); then thresh=5000000      # 720p
+  elif (( px <= 2100000 )); then thresh=10000000     # 1080p
+  elif (( px <= 8300000 )); then thresh=35000000     # 4K
+  else thresh=60000000; fi
+  if [[ "$vc" == h264 || "$vc" == avc ]] && (( br > 0 )) && (( br <= thresh )); then
+    printf 'OK\nBitrate already reasonable for %sx%s\n-\n-\n' "$w" "$h"; return
+  fi
+  if [[ "$vc" == h264 || "$vc" == avc ]]; then
+    printf 'SHRINK\nRe-encode h264 -> hevc (crf 28)\nffmpeg -i "INPUT" -c:v libx265 -crf 28 -preset medium -c:a copy "OUTPUT.mp4"\n~%s (typical -50%%)\n' \
+      "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.5}')")"
+  else
+    printf 'SHRINK\nRe-encode %s -> h264 (crf 23)\nffmpeg -i "INPUT" -c:v libx264 -crf 23 -preset medium -c:a aac -b:a 128k "OUTPUT.mp4"\n~%s (typical -70%%)\n' \
+      "$vc" "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.3}')")"
+  fi
+}
+
+suggest_audio() { # acodec abr size
+  local ac="$1" br="${2:-0}" size="${3:-0}"
+  case "$ac" in
+    pcm_*|wav|flac|alac|aiff|wma*lossless)
+      printf 'SHRINK\nCompress lossless/PCM -> opus 96k\nffmpeg -i "INPUT" -c:a libopus -b:a 96k "OUTPUT.opus"\n~%s (typical -90%%)\n' \
+        "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.08}')")" ;;
+    mp3)
+      if (( br > 192000 )); then
+        printf 'SHRINK\nDownsize mp3 %sk -> opus 128k\nffmpeg -i "INPUT" -c:a libopus -b:a 128k "OUTPUT.opus"\n~%s (typical -40%%)\n' \
+          "$((br/1000))" "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.6}')")"
+      else printf 'OK\nmp3 bitrate already modest\n-\n-\n'; fi ;;
+    aac|opus|vorbis|m4a)
+      printf 'OK\nAlready compressed audio (%s)\n-\n-\n' "$ac" ;;
+    *) printf 'OK\nUnrecognized audio codec (%s)\n-\n-\n' "${ac:-none}" ;;
+  esac
+}
+
+suggest_image() { # ext w h size
+  local ext="$1" w="${2:-0}" h="${3:-0}" size="${4:-0}"
+  case "$ext" in
+    png|bmp|tiff|tif)
+      if (( size > 512000 )); then
+        printf 'SHRINK\nConvert %s -> webp (q80)\nffmpeg -i "INPUT" -c:v libwebp -q:v 80 "OUTPUT.webp"\n~%s (typical -65%%)\n' \
+          "$ext" "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.35}')")"
+      else printf 'OK\nSmall %s, not worth converting\n-\n-\n' "$ext"; fi ;;
+    jpg|jpeg)
+      if (( size > 2097152 )); then
+        printf 'SHRINK\nRe-encode jpeg at q4 (visually similar)\nffmpeg -i "INPUT" -q:v 4 "OUTPUT.jpg"\n~%s (typical -50%%)\n' \
+          "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.5}')")"
+      else printf 'OK\nJPEG size already modest\n-\n-\n'; fi ;;
+    gif)
+      printf 'SHRINK\nConvert gif -> mp4 (h264)\nffmpeg -i "INPUT" -movflags +faststart -pix_fmt yuv420p "OUTPUT.mp4"\n~%s (typical -80%%)\n' \
+        "$(fmt_size "$(awk -v s="$size" 'BEGIN{printf "%.0f", s*0.2}')")" ;;
+    webp|avif|heic|heif)
+      printf 'OK\nAlready modern image format (%s)\n-\n-\n' "$ext" ;;
+    *) printf 'UNKNOWN\nNot a recognized image type\n-\n-\n' ;;
+  esac
+}
+
+kind_of() { # ext vcodec acodec -> video|audio|image|unknown
+  case "$(lower "$1")" in
+    png|jpg|jpeg|webp|avif|bmp|tif|tiff|gif|heic|heif) printf 'image' ;;
+    *) if [ -n "$2" ]; then printf 'video'
+       elif [ -n "$3" ]; then printf 'audio'
+       else printf 'unknown'; fi ;;
+  esac
+}
+
+# ------------------------------------------------------- scanning
+# Parallel arrays, one entry per file.
+F_PATH=(); F_KIND=(); F_VERDICT=(); F_META=(); F_SIZE=(); F_DURV=()
+F_TITLE=(); F_CMD=(); F_EST=()
+
+scan_file() {
+  local file="$1" ext kind verdict title cmd est meta
+  [ -f "$file" ] || { warn "not a file, skipped: $file"; return 0; }
+  [ -r "$file" ] || { warn "unreadable, skipped: $file"; return 0; }
+  ext="$(ext_of "$file")"
+  probe_file "$file"
+  kind="$(kind_of "$ext" "$P_VCODEC" "$P_ACODEC")"
+  case "$kind" in
+    video)
+      meta="$(printf '%s %sx%s %s %s' "$P_VCODEC" "${P_W:-?}" "${P_H:-?}" \
+        "$(fmt_dur "${P_DUR:-0}")" "$(fmt_size "${P_SIZE:-0}")")"
+      { read -r verdict; read -r title; read -r cmd; read -r est; } < <(
+        suggest_video "$P_VCODEC" "${P_W:-0}" "${P_H:-0}" "${P_FBR:-0}" "${P_SIZE:-0}") ;;
+    audio)
+      meta="$(printf '%s %skbps %s %s' "$P_ACODEC" "$(( ${P_ABR:-0} / 1000 ))" \
+        "$(fmt_dur "${P_DUR:-0}")" "$(fmt_size "${P_SIZE:-0}")")"
+      { read -r verdict; read -r title; read -r cmd; read -r est; } < <(
+        suggest_audio "$P_ACODEC" "${P_ABR:-0}" "${P_SIZE:-0}") ;;
+    image)
+      meta="$(printf '%s %sx%s %s' "$ext" "${P_W:-?}" "${P_H:-?}" "$(fmt_size "${P_SIZE:-0}")")"
+      { read -r verdict; read -r title; read -r cmd; read -r est; } < <(
+        suggest_image "$ext" "${P_W:-0}" "${P_H:-0}" "${P_SIZE:-0}") ;;
+    *)
+      verdict="UNKNOWN"; title="Not a recognized media file"; cmd="-"; est="-"
+      meta="$(fmt_size "${P_SIZE:-0}")" ;;
+  esac
+  F_PATH+=("$file"); F_KIND+=("$kind"); F_VERDICT+=("$verdict"); F_META+=("$meta")
+  F_SIZE+=("${P_SIZE:-0}"); F_DURV+=("${P_DUR:-0}")
+  F_TITLE+=("$title"); F_CMD+=("$cmd"); F_EST+=("$est")
+}
+
+collect_inputs() { # fills INPUTS array from args / stdin
+  INPUTS=()
+  if (( $# > 0 )); then
+    INPUTS+=("$@")
+  elif [ ! -t 0 ]; then
+    while IFS= read -r line; do [ -n "$line" ] && INPUTS+=("$line"); done
+  else
+    die "no input: give file/folder paths, or pipe a file list via stdin" 2
+  fi
+}
+
+# ------------------------------------------------------- output modes
+verdict_color() {
+  case "$1" in
+    SHRINK) printf '%s' "$C_YEL" ;; OK) printf '%s' "$C_GRN" ;;
+    *) printf '%s' "$C_DIM" ;; esac
+}
+
+out_table() {
+  local i n=${#F_PATH[@]}
+  printf '%-8s %-42s %10s  %s\n' "VERDICT" "FILE" "SIZE" "DETAIL"
+  for ((i=0;i<n;i++)); do
+    local vc; vc="$(verdict_color "${F_VERDICT[$i]}")"
+    printf '%s%-8s%s %-42.42s %10s  %s\n' "$vc" "${F_VERDICT[$i]}" "$C_RST" \
+      "${F_PATH[$i]##*/}" "$(fmt_size "${F_SIZE[$i]}")" "${F_TITLE[$i]}"
+  done
+}
+
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n'; }
+
+out_json() {
+  local i n=${#F_PATH[@]} cmd
+  printf '{\n  "tool": "shrink-hint", "version": "%s", "files": [\n' "$VERSION"
+  for ((i=0;i<n;i++)); do
+    cmd="${F_CMD[$i]}"; [ "$cmd" = "-" ] && cmd=""
+    printf '    {"path": "%s", "kind": "%s", "verdict": "%s", "meta": "%s", "size_bytes": %s, "suggestion": "%s", "command": "%s", "estimate": "%s"}%s\n' \
+      "$(json_escape "${F_PATH[$i]}")" "${F_KIND[$i]}" "${F_VERDICT[$i]}" \
+      "$(json_escape "${F_META[$i]}")" "${F_SIZE[$i]}" "$(json_escape "${F_TITLE[$i]}")" \
+      "$(json_escape "$cmd")" "$(json_escape "${F_EST[$i]}")" \
+      "$([ $i -lt $((n-1)) ] && echo , || echo '')"
+  done
+  printf '  ]\n}\n'
+}
+
+# ------------------------------------------------------- TUI
+tui() {
+  local n=${#F_PATH[@]} sel=0 top=0 key rows cols i
+  [ "$n" -gt 0 ] || die "no files to show"
+  command -v tput >/dev/null || die "tput not found, cannot run TUI (use --table)"
+  tput smcup; tput civis
+  trap 'tput rmcup; tput cnorm; stty sane 2>/dev/null; exit 0' EXIT INT TERM
+  stty -echo -icanon min 1 time 0 2>/dev/null || true
+  while :; do
+    rows=$(tput lines); cols=$(tput cols)
+    tput cup 0 0; tput ed
+    printf '%sshrink-hint%s  %d file(s)  %s↑/↓ navigate · Enter detail · q quit%s\n' \
+      "$C_BLD" "$C_RST" "$n" "$C_DIM" "$C_RST"
+    printf '%s\n' "────────────────────────────────────────"
+    local list_h=$(( rows - 12 )); [ "$list_h" -lt 4 ] && list_h=4
+    (( sel < top )) && top=$sel
+    (( sel >= top + list_h )) && top=$(( sel - list_h + 1 ))
+    for ((i=top; i<top+list_h && i<n; i++)); do
+      local mark="  " vc
+      (( i == sel )) && mark="▸ "
+      vc="$(verdict_color "${F_VERDICT[$i]}")"
+      if (( i == sel )); then printf '%s%s%-8s %s%s\n' "$C_BLD$mark" "$vc" "${F_VERDICT[$i]}" "$C_RST" \
+          "${F_PATH[$i]##*/}" | cut -c1-"$cols"
+      else printf '%s%-8s %s%s\n' "$mark$vc" "${F_VERDICT[$i]}" "$C_RST" \
+          "${F_PATH[$i]##*/}" | cut -c1-"$cols"; fi
+    done
+    printf '%s\n' "────────────────────────────────────────"
+    printf '%sDETAIL%s %s\n' "$C_BLD" "$C_RST" "${F_PATH[$sel]}"
+    printf '  meta: %s\n' "${F_META[$sel]}"
+    local vc; vc="$(verdict_color "${F_VERDICT[$sel]}")"
+    printf '  verdict: %s%s%s — %s\n' "$vc" "${F_VERDICT[$sel]}" "$C_RST" "${F_TITLE[$sel]}"
+    if [ "${F_CMD[$sel]}" != "-" ]; then
+      printf '  run: %s\n' "${F_CMD[$sel]//INPUT/${F_PATH[$sel]##*/}}"
+      printf '  est. size: %s\n' "${F_EST[$sel]}"
+    fi
+    IFS= read -rsn1 key || break
+    case "$key" in
+      $'\x1b') IFS= read -rsn2 -t 0.05 rest || rest=""
+        case "$rest" in "[A") (( sel > 0 )) && ((sel--)) ;;
+                         "[B") (( sel < n-1 )) && ((sel++)) ;;
+                         *) break ;; esac ;;
+      k|K) (( sel > 0 )) && ((sel--)) ;;
+      j|J) (( sel < n-1 )) && ((sel++)) ;;
+      q|Q) break ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------- CLI
+print_help() {
+  cat <<'EOF'
+shrink-hint — scan media files, get concrete ffmpeg compression suggestions.
+
+Usage:
+  shrink-hint [options] <file|dir>...        scan files or folders
+  shrink-hint -r <dir>...                    scan folders recursively
+  find clips -type f | shrink-hint --table   read file list from stdin
+
+Options:
+  -r, --recursive   recurse into directories
+      --table       print a plain table (default when not a TTY)
+      --json        print machine-readable JSON
+      --tui         force the interactive TUI
+      --help        show this help
+      --version     show version
+
+TUI keys: Up/Down or j/k to move, q or Esc to quit.
+
+Exit codes: 0 ok · 1 runtime error (e.g. ffprobe missing) · 2 usage error.
+Requires ffprobe (ships with ffmpeg). Read-only: never modifies files.
+EOF
+}
+
+main() {
+  local recursive=0 mode="auto" arg
+  local -a paths=()
+  while (( $# > 0 )); do
+    arg="$1"; shift
+    case "$arg" in
+      -r|--recursive) recursive=1 ;;
+      --table) mode="table" ;; --json) mode="json" ;; --tui) mode="tui" ;;
+      --help) print_help; exit 0 ;;
+      --version) printf 'shrink-hint %s\n' "$VERSION"; exit 0 ;;
+      --) paths+=("$@"); break ;;
+      -*) die "unknown option: $arg (see --help)" 2 ;;
+      *) paths+=("$arg") ;;
+    esac
+  done
+
+  command -v ffprobe >/dev/null 2>&1 || \
+    die "ffprobe not found. Install ffmpeg (https://ffmpeg.org/download.html) and retry." 1
+
+  if (( ${#paths[@]} > 0 )); then collect_inputs "${paths[@]}"
+  else collect_inputs; fi
+  local p f
+  for p in "${INPUTS[@]}"; do
+    if [ -d "$p" ]; then
+      if (( recursive )); then
+        while IFS= read -r -d '' f; do scan_file "$f"; done < <(find "$p" -type f -print0 2>/dev/null)
+      else
+        while IFS= read -r -d '' f; do scan_file "$f"; done < <(find "$p" -maxdepth 1 -type f -print0 2>/dev/null)
+      fi
+    elif [ -e "$p" ]; then scan_file "$p"
+    else die "no such file or directory: $p" 1; fi
+  done
+
+  (( ${#F_PATH[@]} > 0 )) || die "no files found to scan" 1
+
+  case "$mode" in
+    table) out_table ;;
+    json) out_json ;;
+    tui) tui ;;
+    auto) if [ -t 1 ]; then tui; else out_table; fi ;;
+  esac
+}
+
+# Allow sourcing for unit tests without running main.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
